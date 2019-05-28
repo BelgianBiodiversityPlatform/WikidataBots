@@ -25,15 +25,7 @@ STATED_IN_PROPERTY_ID = 'P248'
 RETRIEVED_PROPERTY_ID = 'P813'
 
 TEST_MODE = True
-TEST_MODE_LIMIT = 3  # In test mode, how many edits do we perform?
-
-#site = pywikibot.Site("en", "wikipedia")
-#page = pywikibot.Page(site, u"Douglas Adams")
-#item = pywikibot.ItemPage.fromPage(page)
-#dictionary = item.get()
-#print(dictionary)
-#print(dictionary.keys())
-#print(item)
+TEST_MODE_LIMIT = 50  # In test mode, how many edits do we perform?
 
 class MultipleWikidataEntriesFound(Exception):
     pass
@@ -120,10 +112,23 @@ def add_claim(target_item_q_code: str, property_id: str, property_value_q_code: 
 def add_host_plant_claim(lepido_q_code: str, plant_q_code: str):
     add_claim(lepido_q_code, HOST_PROPERTY_ID, plant_q_code, 'Add host plant information', sources=build_sources_claims())
 
+def claims_reference_us(claim: pywikibot.Claim) -> bool:
+    for source in claim.sources:
+        if STATED_IN_PROPERTY_ID in source:
+            for source_claim in source[STATED_IN_PROPERTY_ID]:
+                if source_claim.target.id == CATALOGUE_Q_VALUE:
+                    return True
+
+    return False
+
+def add_us_as_source(existing_claim: pywikibot.Claim):
+    existing_claim.addSources(build_sources_claims())
+
+
 def update_host_properties(lepido_q_code: str, plant_species_names: List[str]):
     global hp_not_found_counter
     global duplicate_hp_entries_counter
-    global edited_lepido_counter
+    global editions_counter
 
     # 1. Get q codes for plant species
     plant_species_q_codes = set()
@@ -137,26 +142,33 @@ def update_host_properties(lepido_q_code: str, plant_species_names: List[str]):
             duplicate_hp_entries_counter = duplicate_hp_entries_counter + 1
             logger.warning(f'Multiple wikidata entry found for plant: {plant_name}')
     
+    plant_species_q_codes_to_create = plant_species_q_codes.copy()
+
     # 2. For each of this plants, check if the lepidoptera has already the host property set
     lepi_data = get_wikidata_data(q_code=lepido_q_code)
     if HOST_PROPERTY_ID in lepi_data['claims']: # Wikidata already has host plants info for this lepidoptera
+        logger.info("Wikidata already has some host plant info for this lepidoptera")
         # Update, if necessary
-
-        # Is it the same plant?
-            # Is it already referencing us?
-                # Yes: do nothing
-            # No:
-                # Add our reference
-        # No, it's for another plant?
-            # We add our own
-        pass
+        for existing_claim in lepi_data['claims'][HOST_PROPERTY_ID]:
+            # Does this claim concern a plant we also have:
+                if existing_claim.target.id in plant_species_q_codes: # Yes
+                    logger.info("Wikidata already knows about this lepidoptera <-> host plant relationship")
+                    plant_species_q_codes_to_create.remove(existing_claim.target.id)  # In all cases, we don't need to create a new claim
+                    if claims_reference_us(existing_claim):
+                        logger.info("We already cited as a source -> do nothing")
+                    else:
+                        logger.info("We have to add us as a source for this claim")
+                        add_us_as_source(existing_claim)
+                        editions_counter = editions_counter + 1
+                
+            
     else:
-        logger.info("No host plant info for this lepidoptera yet, we can add our own")
-        for plant_species_q_code in plant_species_q_codes:
-            logger.info(f"Adding host plant ({plant_species_q_code})...")
-            add_host_plant_claim(lepido_q_code, plant_species_q_code)
-        
-        edited_lepido_counter = edited_lepido_counter + 1
+        logger.info("No host plant info for this lepidoptera @Wikidata yet")
+    
+    for plant_species_q_code in plant_species_q_codes_to_create:
+        logger.info(f"Adding host plant ({plant_species_q_code})...")
+        add_host_plant_claim(lepido_q_code, plant_species_q_code)     
+        editions_counter = editions_counter + 1
 
 
 def import_lepidotera_data(species_data):
@@ -166,12 +178,12 @@ def import_lepidotera_data(species_data):
     global duplicate_entries_counter
     global possible_missing_id
     global no_hostplant_data_counter
-    global edited_lepido_counter
+    global editions_counter
     
     species_name = species_data['name']
     species_id = species_data['id']
 
-    if TEST_MODE and (edited_lepido_counter >= TEST_MODE_LIMIT):
+    if TEST_MODE and (editions_counter >= TEST_MODE_LIMIT):
         raise TestModeCompleted
 
     logger.info(f"Processing {species_name}...")
@@ -230,6 +242,8 @@ def main():
     For {duplicate_entries_counter} species, multiple entries were found @Wikidata.
     Identified {possible_missing_id} possible cases of missing P5862 property @Wikidata.
     Host plants: {hp_not_found_counter} not found @Wikidata, {duplicate_hp_entries_counter} found with duplicates
+
+    {editions_counter} editions performed @Wikidata.
     """
     logger.info(stats_str)
 
@@ -245,7 +259,7 @@ if __name__ == "__main__":
     hp_not_found_counter = 0
     duplicate_hp_entries_counter = 0
 
-    edited_lepido_counter = 0
+    editions_counter = 0
 
     logger = logging.getLogger(__name__)
     coloredlogs.install(level=LOGLEVEL)
