@@ -12,7 +12,7 @@ import datetime
 sys.path.append('/Users/nicolasnoe/pywikibot'); import pywikibot
 
 CATALOGUE_SPECIES_DETAILS_ENDPOINT = "https://projects.biodiversity.be/lepidoptera/all_species_details_json/"
-LOGLEVEL = 'INFO'
+LOGLEVEL = 'WARNING'
 
 WIKIDATA_SPARQL_ENDPOINT = 'https://query.wikidata.org/bigdata/namespace/wdq/sparql'
 TAXON_RANK_PROPERTY_ID = 'P105'
@@ -24,7 +24,7 @@ CATALOGUE_Q_VALUE = 'Q59799645'
 STATED_IN_PROPERTY_ID = 'P248'
 RETRIEVED_PROPERTY_ID = 'P813'
 
-TEST_MODE = True
+TEST_MODE = False
 TEST_MODE_LIMIT = 50  # In test mode, how many edits do we perform?
 
 class MultipleWikidataEntriesFound(Exception):
@@ -80,7 +80,7 @@ def get_wikidata_data(q_code: str) -> Dict[str, Any]:
     item = pywikibot.ItemPage(repo, q_code)
     return item.get()
 
-@functools.lru_cache() # We can cache it since the scxript will not run on multiple days
+@functools.lru_cache() # We can cache it since the script will not run on multiple days
 def build_sources_claims() -> List[pywikibot.Claim]:
     global repo
 
@@ -126,9 +126,9 @@ def add_us_as_source(existing_claim: pywikibot.Claim):
 
 
 def update_host_properties(lepido_q_code: str, plant_species_names: List[str]):
-    global hp_not_found_counter
     global duplicate_hp_entries_counter
     global editions_counter
+    global unmatched_plants_set
 
     # 1. Get q codes for plant species
     plant_species_q_codes = set()
@@ -136,8 +136,9 @@ def update_host_properties(lepido_q_code: str, plant_species_names: List[str]):
         try:
             plant_species_q_codes.add(get_wikidata_q_identifier(plant_name))
         except NoWikidataEntriesFound:
-            hp_not_found_counter = hp_not_found_counter + 1
-            logger.warning(f'No wikidata entry found for plant: {plant_name}')
+            if plant_name not in unmatched_plants_set:
+                unmatched_plants_set.add(plant_name)
+                logger.warning(f'No wikidata entry found for plant: {plant_name}')
         except MultipleWikidataEntriesFound:
             duplicate_hp_entries_counter = duplicate_hp_entries_counter + 1
             logger.warning(f'Multiple wikidata entry found for plant: {plant_name}')
@@ -203,9 +204,9 @@ def import_lepidotera_data(species_data):
             species_not_found_counter = species_not_found_counter + 1
             logger.warning(f"No Wikidata entry found for {species_name}")
             try:
-                possible_missing_id = possible_missing_id + 1
                 get_wikidata_q_identifier(species_name=species_name)
                 logger.warning(f"... but we have a candidate by label. Missing lepido ID (P5862) @Wikidata?")
+                possible_missing_id = possible_missing_id + 1
             except (NoWikidataEntriesFound, MultipleWikidataEntriesFound): 
                 pass   
 
@@ -241,11 +242,11 @@ def main():
     {species_not_found_counter} species not found @Wikidata.
     For {duplicate_entries_counter} species, multiple entries were found @Wikidata.
     Identified {possible_missing_id} possible cases of missing P5862 property @Wikidata.
-    Host plants: {hp_not_found_counter} not found @Wikidata, {duplicate_hp_entries_counter} found with duplicates
+    Host plants: {len(unmatched_plants_set)} not found @Wikidata, {duplicate_hp_entries_counter} found with duplicates
 
     {editions_counter} editions performed @Wikidata.
     """
-    logger.info(stats_str)
+    print(stats_str)
 
 
 if __name__ == "__main__":
@@ -256,10 +257,11 @@ if __name__ == "__main__":
     possible_missing_id = 0
     no_hostplant_data_counter = 0
 
-    hp_not_found_counter = 0
     duplicate_hp_entries_counter = 0
 
     editions_counter = 0
+
+    unmatched_plants_set = set()
 
     logger = logging.getLogger(__name__)
     coloredlogs.install(level=LOGLEVEL)
