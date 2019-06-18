@@ -2,6 +2,7 @@
 import functools
 import logging
 import sys
+import time
 from logging import warning
 from typing import Any, Dict, List, Optional
 
@@ -12,13 +13,14 @@ import datetime
 sys.path.append('/Users/nicolasnoe/pywikibot'); import pywikibot
 
 CATALOGUE_SPECIES_DETAILS_ENDPOINT = "https://projects.biodiversity.be/lepidoptera/all_species_details_json/"
-LOGLEVEL = 'WARNING'
+LOGLEVEL = 'INFO'
 
-WIKIDATA_SPARQL_ENDPOINT = 'https://query.wikidata.org/bigdata/namespace/wdq/sparql'
+WIKIDATA_SPARQL_ENDPOINT = 'https://query.wikidata.org/sparql'
 TAXON_RANK_PROPERTY_ID = 'P105'
 TAXON_NAME_PROPERTY_ID = 'P225'
 HOST_PROPERTY_ID = 'P2975'
 SPECIES_VALUE_ID = 'Q7432'
+GENUS_VALUE_ID = 'Q34740'
 
 CATALOGUE_Q_VALUE = 'Q59799645'
 STATED_IN_PROPERTY_ID = 'P248'
@@ -26,6 +28,8 @@ RETRIEVED_PROPERTY_ID = 'P813'
 
 TEST_MODE = False
 TEST_MODE_LIMIT = 50  # In test mode, how many edits do we perform?
+
+SPARQL_QUERY_THROTTLING = True
 
 class MultipleWikidataEntriesFound(Exception):
     pass
@@ -37,12 +41,11 @@ class TestModeCompleted(Exception):
     pass
 
 @functools.lru_cache(maxsize=4096)
-def get_wikidata_q_identifier(species_name=None, lepido_id=None):
-    # If a species name is passed, search is performed on it.
-    # If a lepidoptera id is passed, search is performed on it.
+def get_wikidata_q_identifier(species_name=None, lepido_id=None, genus_name=None):
+    # If a species name/genus name is passed, search is performed on it.
+    # If a lepidoptera_id is passed, search is performed on it.
 
-    # If used with a species name, can be used for all kind of species (not only lepidoptera)
-
+    # If used with a species name / genus name, can be used for all kind of species (not only lepidoptera)
     if species_name:
         # We previously searched on the label, but this one is often sets 
         # to some vernacular name. Taxon name seems very often populated, 
@@ -51,13 +54,21 @@ def get_wikidata_q_identifier(species_name=None, lepido_id=None):
             ?item wdt:{TAXON_NAME_PROPERTY_ID} "{species_name}". 
             ?item wdt:{TAXON_RANK_PROPERTY_ID} wd:{SPECIES_VALUE_ID}.
             }}'''
-    else:
+    elif lepido_id:
         query = f'''SELECT ?item ?itemLabel WHERE {{
             ?item wdt:P5862 "{lepido_id}";
             wdt:{TAXON_RANK_PROPERTY_ID} wd:{SPECIES_VALUE_ID}.
             }}'''
+    else:
+        query = f'''SELECT ?item ?itemLabel WHERE {{
+            ?item wdt:{TAXON_NAME_PROPERTY_ID} "{genus_name}". 
+            ?item wdt:{TAXON_RANK_PROPERTY_ID} wd:{GENUS_VALUE_ID}.
+            }}'''
     
     data = requests.get(WIKIDATA_SPARQL_ENDPOINT, params={'query': query.replace('\n', ' '), 'format': 'json'}).json()
+    if SPARQL_QUERY_THROTTLING:
+        time.sleep(1)    
+    
     results = data['results']['bindings']
     if len(results) == 1:
         return results[0]['item']['value'].rsplit('/', 1)[-1]  # Get Wikidata URI, split for the Q identifier
@@ -66,10 +77,10 @@ def get_wikidata_q_identifier(species_name=None, lepido_id=None):
     elif len(results) > 1:
         raise MultipleWikidataEntriesFound
 
-def has_host_plant_species_observations(species_data):
+def has_host_plant_observations(species_data):
     observations = species_data['observations']
     for observation in observations:
-        if observation['observationType'] == 'HostPlantSpecies':
+        if observation['observationType'] in ('HostPlantSpecies', 'HostPlantGenus'):
             return True
     return False
 
@@ -125,25 +136,40 @@ def add_us_as_source(existing_claim: pywikibot.Claim):
     existing_claim.addSources(build_sources_claims())
 
 
-def update_host_properties(lepido_q_code: str, plant_species_names: List[str]):
+def update_host_properties(lepido_q_code: str, plant_species_names: List[str], plant_genera_names: List[str]):
     global duplicate_hp_entries_counter
     global editions_counter
     global unmatched_plants_set
 
     # 1. Get q codes for plant species
-    plant_species_q_codes = set()
+    plant_q_codes = set()
+
+    # For plant species
     for plant_name in plant_species_names:
         try:
-            plant_species_q_codes.add(get_wikidata_q_identifier(plant_name))
+            plant_q_codes.add(get_wikidata_q_identifier(species_name=plant_name))
         except NoWikidataEntriesFound:
             if plant_name not in unmatched_plants_set:
                 unmatched_plants_set.add(plant_name)
-                logger.warning(f'No wikidata entry found for plant: {plant_name}')
+                logger.warning(f'No wikidata entry found for plant species: {plant_name}')
+        except MultipleWikidataEntriesFound:
+            duplicate_hp_entries_counter = duplicate_hp_entries_counter + 1
+            logger.warning(f'Multiple wikidata entry found for plant: {plant_name}')
+
+    # For plant genera
+    # TODO: Factorize w/ plant species
+    for plant_name in plant_genera_names:
+        try:
+            plant_q_codes.add(get_wikidata_q_identifier(genus_name=plant_name))
+        except NoWikidataEntriesFound:
+            if plant_name not in unmatched_plants_set:
+                unmatched_plants_set.add(plant_name)
+                logger.warning(f'No wikidata entry found for plant genus: {plant_name}')
         except MultipleWikidataEntriesFound:
             duplicate_hp_entries_counter = duplicate_hp_entries_counter + 1
             logger.warning(f'Multiple wikidata entry found for plant: {plant_name}')
     
-    plant_species_q_codes_to_create = plant_species_q_codes.copy()
+    plant_q_codes_to_create = plant_q_codes.copy()
 
     # 2. For each of this plants, check if the lepidoptera has already the host property set
     lepi_data = get_wikidata_data(q_code=lepido_q_code)
@@ -152,9 +178,9 @@ def update_host_properties(lepido_q_code: str, plant_species_names: List[str]):
         # Update, if necessary
         for existing_claim in lepi_data['claims'][HOST_PROPERTY_ID]:
             # Does this claim concern a plant we also have:
-                if existing_claim.target.id in plant_species_q_codes: # Yes
-                    logger.info("Wikidata already knows about this lepidoptera <-> host plant relationship")
-                    plant_species_q_codes_to_create.remove(existing_claim.target.id)  # In all cases, we don't need to create a new claim
+                if existing_claim.target.id in plant_q_codes: # Yes
+                    logger.info(f"Wikidata already knows about this lepidoptera <-> host plant ({existing_claim.target.id}) relationship")
+                    plant_q_codes_to_create.remove(existing_claim.target.id)  # In all cases, we don't need to create a new claim
                     if claims_reference_us(existing_claim):
                         logger.info("We already cited as a source -> do nothing")
                     else:
@@ -166,9 +192,9 @@ def update_host_properties(lepido_q_code: str, plant_species_names: List[str]):
     else:
         logger.info("No host plant info for this lepidoptera @Wikidata yet")
     
-    for plant_species_q_code in plant_species_q_codes_to_create:
-        logger.info(f"Adding host plant ({plant_species_q_code})...")
-        add_host_plant_claim(lepido_q_code, plant_species_q_code)     
+    for plant_q_code in plant_q_codes_to_create:
+        logger.info(f"Adding host plant ({plant_q_code})...")
+        add_host_plant_claim(lepido_q_code, plant_q_code)     
         editions_counter = editions_counter + 1
 
 
@@ -191,14 +217,18 @@ def import_lepidotera_data(species_data):
     if (species_data['is_synonym']):
         synonym_counter = synonym_counter + 1
         logger.info("\tSynonym, skipping.")
-    elif not has_host_plant_species_observations(species_data):
+    elif not has_host_plant_observations(species_data):
         no_hostplant_data_counter = no_hostplant_data_counter + 1
         logger.info("We don't have any host plant species data, skipping.")
     else:
         accepted_counter = accepted_counter + 1
         try:
             q_code = get_wikidata_q_identifier(lepido_id=species_id)
-            update_host_properties(q_code, [obs['name'] for obs in species_data['observations'] if obs['observationType'] == 'HostPlantSpecies'])
+
+            plant_species_names = [obs['name'] for obs in species_data['observations'] if obs['observationType'] == 'HostPlantSpecies']
+            plant_genera_names = [obs['name'] for obs in species_data['observations'] if obs['observationType'] == 'HostPlantGenus']
+
+            update_host_properties(q_code, plant_species_names, plant_genera_names)
         except NoWikidataEntriesFound:
             # Not found with the ID, check if we have a candidate by name
             species_not_found_counter = species_not_found_counter + 1
